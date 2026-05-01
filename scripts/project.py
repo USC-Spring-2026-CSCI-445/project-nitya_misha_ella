@@ -172,6 +172,31 @@ class PFRRTController:
             self._pf.measure(z, a)
 
     # ----------------------------------------------------------------------
+    # Laser helpers — filter bad beams and find front correctly on sim + real
+    # ----------------------------------------------------------------------
+    def _valid_range(self, r):
+        if r is None:
+            return False
+        return math.isfinite(r) and r >= 0.12
+
+    def _front_min_range(self, half_window_deg=25):
+        """Min valid range within a forward-facing cone, using per-beam angle lookup."""
+        if self.laserscan is None:
+            return float("inf")
+        scan = self.laserscan
+        if len(scan.ranges) == 0:
+            return float("inf")
+
+        half_rad = math.radians(half_window_deg)
+        valid = []
+        for i, r in enumerate(scan.ranges):
+            beam_angle = angle_to_neg_pi_to_pi(scan.angle_min + i * scan.angle_increment)
+            if abs(beam_angle) <= half_rad and self._valid_range(r):
+                valid.append(r)
+
+        return min(valid) if valid else float("inf")
+
+    # ----------------------------------------------------------------------
     # Phase 1: Localization with PF (explore a bit)
     # ----------------------------------------------------------------------
     def localize_with_pf(self, max_steps: int = 400):
@@ -185,8 +210,9 @@ class PFRRTController:
         ######### Your code starts here #########
         rate = rospy.Rate(1.0) # explore at ~1 Hz loop
         rotation_attempts = 0
-        move_distance = 0.25 # move farther per step
+        move_distance = 0.18 # move farther per step
         close_count = 0
+        min_steps_conv = 12
 
         for step in range(max_steps):
             if rospy.is_shutdown():
@@ -195,59 +221,32 @@ class PFRRTController:
             # --- Prevent getting stuck spinning ---
             if rotation_attempts > 5:
                 rospy.loginfo("Too many rotations; moving forward to escape.")
-                self.move_forward(0.3)
+                self.move_forward(0.10)
                 rotation_attempts = 0
 
-            # Get front range safely
-            front_range = None
+            # Get front range safely (filters 0.0/NaN, handles sim + real index layout)
+            front_range = self._front_min_range(half_window_deg=25)
             too_close = False
 
-            if self.laserscan is not None:
-                angle_min = self.laserscan.angle_min
-                angle_inc = self.laserscan.angle_increment
-                ranges = self.laserscan.ranges
-                num_ranges = len(ranges)
+            # decide "too close" based on this sector only
+            if front_range < 0.28:
+                close_count += 1
+            else:
+                close_count = 0
 
-                # --- FRONT WINDOW ONLY ---
-                # we look at ~ +/- 25 degrees in front of robot
-                front_window_deg = 25.0
-                low_angle = -math.radians(front_window_deg)
-                high_angle = math.radians(front_window_deg)
-
-                low_idx = int(round((low_angle - angle_min) / angle_inc))
-                high_idx = int(round((high_angle - angle_min) / angle_inc))
-                low_idx = max(0, min(low_idx, num_ranges - 1))
-                high_idx = max(0, min(high_idx, num_ranges - 1))
-                if low_idx > high_idx:
-                    low_idx, high_idx = high_idx, low_idx
-
-                front_sector = [r for r in ranges[low_idx:high_idx + 1] if not np.isinf(r)]
-
-                # also get the exact forward beam
-                zero_idx = int(round((0.0 - angle_min) / angle_inc))
-                zero_idx = max(0, min(zero_idx, num_ranges - 1))
-                front_range = ranges[zero_idx]
-
-                # decide "too close" based on this sector only
-                if len(front_sector) > 0 and min(front_sector) < 0.28:
-                    close_count += 1
-                else:
-                    close_count = 0
-
-                # require it to be close twice in a row to react
-                if close_count >= 2:
-                    too_close = True
+            # require it to be close twice in a row to react
+            if close_count >= 2:
+                too_close = True
 
             if too_close:
-                rospy.loginfo("Too close to obstacle, backing up & rotating.")
-                self.move_forward(-0.12)
+                rospy.loginfo("Too close to obstacle, rotating.")
                 self.rotate_in_place(uniform(math.pi / 5, math.pi / 3)) # bigger rotation away
                 rotation_attempts += 1
                 rate.sleep()
                 continue
 
             # --- Main motion policy ---
-            if front_range is None or np.isinf(front_range) or front_range > 0.7:
+            if np.isinf(front_range) or front_range > 0.7:
                 # Move forward more confidently if clear
                 self.move_forward(move_distance)
                 rotation_attempts = 0
@@ -269,10 +268,11 @@ class PFRRTController:
             if pts.shape[0] > 0:
                 dists = np.linalg.norm(pts - np.array([x_est, y_est]), axis=1)
                 std_dev = np.std(dists)
-                rospy.loginfo(f"[Step {step}] Particle spread: {std_dev:.3f}")
-            
+                near = np.sum(dists < 0.3) / len(dists)
+                rospy.loginfo(f"[Step {step}] Particle spread: {std_dev:.3f}, concentration: {near:.2f}")
+
                 sensor_ok = False
-                if front_range is not None and not np.isinf(front_range):
+                if not np.isinf(front_range):
                     # predicted front range from PF estimate
                     predicted_front = self._pf.map_.closest_distance( (x_est, y_est), theta_est )
                     if predicted_front is None:
@@ -281,8 +281,8 @@ class PFRRTController:
                     if abs(predicted_front - front_range) < 0.25:
                         sensor_ok = True
 
-                if std_dev < 0.12 and sensor_ok:
-                    rospy.loginfo("Particle filter converged (std < 0.12 and sensor matched).")
+                if step >= min_steps_conv and std_dev < 0.12 and sensor_ok and near > 0.75:
+                    rospy.loginfo("Particle filter converged (std < 0.12, sensor matched, 75% concentration).")
                     break
 
             rate.sleep()
